@@ -90,26 +90,84 @@ class MMILB(nn.Module):
         return lld, sample_dict, H
 
 
+class ProjectionHead(nn.Module):
+    """Projection head for contrastive learning.
+
+    This module projects embeddings into a normalized latent space where
+    contrastive loss is computed.
+    """
+
+    def __init__(self, input_dim, hidden_dim=None, output_dim=None, use_batchnorm=True, dropout=0.0):
+        super(ProjectionHead, self).__init__()
+        hidden_dim = hidden_dim or input_dim
+        output_dim = output_dim or input_dim
+
+        layers = [nn.Linear(input_dim, hidden_dim)]
+        if use_batchnorm:
+            layers.append(nn.BatchNorm1d(hidden_dim))
+        layers.append(nn.ReLU(inplace=True))
+        if dropout > 0:
+            layers.append(nn.Dropout(dropout))
+        if hidden_dim != output_dim:
+            layers.append(nn.Linear(hidden_dim, output_dim))
+
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = self.net(x)
+        return F.normalize(x, dim=-1)
+
+
+class NTXentLoss(nn.Module):
+    """Normalized temperature scaled cross entropy loss."""
+
+    def __init__(self, temperature=0.07):
+        super(NTXentLoss, self).__init__()
+        self.temperature = temperature
+
+    def forward(self, z_i, z_j):
+        z_i = F.normalize(z_i, dim=-1)
+        z_j = F.normalize(z_j, dim=-1)
+
+        logits = torch.matmul(z_i, z_j.t()) / self.temperature
+        labels = torch.arange(z_i.size(0), device=logits.device)
+
+        loss_i = F.cross_entropy(logits, labels)
+        loss_j = F.cross_entropy(logits.t(), labels)
+        return 0.5 * (loss_i + loss_j)
+
+
+class CrossModalContrastive(nn.Module):
+    """Cross-modal contrastive learning module."""
+
+    def __init__(self, x_size, y_size, projection_dim=128, temperature=0.07, dropout=0.0):
+        super(CrossModalContrastive, self).__init__()
+        self.project_x = ProjectionHead(x_size, hidden_dim=x_size, output_dim=projection_dim,
+                                        use_batchnorm=True, dropout=dropout)
+        self.project_y = ProjectionHead(y_size, hidden_dim=y_size, output_dim=projection_dim,
+                                        use_batchnorm=True, dropout=dropout)
+        self.loss_fn = NTXentLoss(temperature=temperature)
+
+    def forward(self, x, y):
+        z_x = self.project_x(x)
+        z_y = self.project_y(y)
+        loss = self.loss_fn(z_x, z_y)
+        return loss, z_x, z_y
+
+
 class CPC(nn.Module):
-    """
-        Contrastive Predictive Coding: score computation. See https://arxiv.org/pdf/1807.03748.pdf.
+    """Contrastive Predictive Coding with stable InfoNCE loss."""
 
-        Args:
-            x_size (int): embedding size of input modality representation x
-            y_size (int): embedding size of input modality representation y
-    """
-
-    def __init__(self, x_size, y_size, n_layers=1, activation='Tanh'):
+    def __init__(self, x_size, y_size, n_layers=1, activation='Tanh', temperature=0.07):
         super().__init__()
         self.x_size = x_size
         self.y_size = y_size
         self.layers = n_layers
+        self.temperature = temperature
         self.activation = getattr(nn, activation)
+
         if n_layers == 1:
-            self.net = nn.Linear(
-                in_features=y_size,
-                out_features=x_size
-            )
+            self.net = nn.Linear(in_features=y_size, out_features=x_size)
         else:
             net = []
             for i in range(n_layers):
@@ -121,19 +179,15 @@ class CPC(nn.Module):
             self.net = nn.Sequential(*net)
 
     def forward(self, x, y):
-        """Calulate the score
-        """
-        # import ipdb;ipdb.set_trace()
-        x_pred = self.net(y)  # bs, emb_size
+        """Compute contrastive loss for paired representations."""
+        x_pred = self.net(y)
+        x_pred = F.normalize(x_pred, dim=-1)
+        x = F.normalize(x, dim=-1)
 
-        # normalize to unit sphere
-        x_pred = x_pred / x_pred.norm(dim=1, keepdim=True)
-        x = x / x.norm(dim=1, keepdim=True)
-
-        pos = torch.sum(x * x_pred, dim=-1)  # bs
-        neg = torch.logsumexp(torch.matmul(x, x_pred.t()), dim=-1)  # bs
-        nce = -(pos - neg).mean()
-        return nce
+        logits = torch.matmul(x, x_pred.t()) / self.temperature
+        labels = torch.arange(x.size(0), device=logits.device)
+        loss = F.cross_entropy(logits, labels)
+        return loss
 
 
 class PositionwiseFeedForward(nn.Module):
@@ -161,16 +215,28 @@ class MaskedNLLLoss(nn.Module):
 
     def forward(self, pred, target, mask):
         """
-        pred -> batch*seq_len, n_classes
+        pred -> batch*seq_len, n_classes or total_valid_nodes, n_classes
         target -> batch*seq_len
         mask -> batch, seq_len
         """
-        mask_ = mask.view(-1,1)
-        if type(self.weight)==type(None):
-            loss = self.loss(pred*mask_, target)/torch.sum(mask)
+        target_flat = target.view(-1)
+        mask_flat = mask.view(-1)
+
+        if pred.size(0) != target_flat.size(0):
+            valid = mask_flat > 0
+            target_flat = target_flat[valid]
+
+            if type(self.weight) == type(None):
+                loss = self.loss(pred, target_flat) / torch.sum(mask)
+            else:
+                loss = self.loss(pred, target_flat) / torch.sum(self.weight[target_flat])
         else:
-            loss = self.loss(pred*mask_, target)\
-                            /torch.sum(self.weight[target]*mask_.squeeze())
+            mask_ = mask_flat.view(-1, 1)
+            if type(self.weight) == type(None):
+                loss = self.loss(pred * mask_, target_flat) / torch.sum(mask)
+            else:
+                loss = self.loss(pred * mask_, target_flat) / torch.sum(self.weight[target_flat] * mask_flat)
+
         return loss
 
 class MaskedMSELoss(nn.Module):

@@ -1,5 +1,5 @@
 import os
-
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 os.environ["CUDA_VISIBLE_DEVICES"] = "0, 1"
 
 import numpy as np, argparse, time, pickle, random
@@ -14,7 +14,29 @@ from sklearn.metrics import f1_score, confusion_matrix, accuracy_score, classifi
     precision_recall_fscore_support
 import pickle as pk
 import datetime
-from FourierGNNmodel import MaskedKLDivLoss, DialogueGCNModel
+from FourierGNNmodel import MaskedKLDivLoss, DialogueGCNModel, FocalLoss, LabelSmoothingCrossEntropy
+
+
+def classification_report_filter_zero_rows(y_true, y_pred, sample_weight=None, digits=4):
+    """Return a classification report string without rows having all-zero metrics."""
+    report_str = classification_report(y_true, y_pred, sample_weight=sample_weight,
+                                       digits=digits, zero_division=0)
+    filtered_lines = []
+    for line in report_str.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            filtered_lines.append(line)
+            continue
+        parts = stripped.split()
+        # keep header and summary lines
+        if len(parts) < 5:
+            filtered_lines.append(line)
+            continue
+        # label rows: precision recall f1-score support
+        if parts[1] == '0.0000' and parts[2] == '0.0000' and parts[3] == '0.0000':
+            continue
+        filtered_lines.append(line)
+    return '\n'.join(filtered_lines)
 
 # We use seed = 27350 for reproduction of the results reported in the paper.
 seed = 27350
@@ -128,7 +150,7 @@ def train_or_eval_graph_model(model, loss_function, kl_loss, dataloader, cuda, m
             elif modals == 'l':
                 textf = textf
 
-        lengths = [(umask[j] == 1).nonzero().tolist()[-1][0] + 1 for j in range(len(umask))]
+        lengths = torch.sum(umask, dim=1).int().tolist()
 
         log_prob1, log_prob2, log_prob3, all_log_prob, all_prob, \
         kl_log_prob1, kl_log_prob2, kl_log_prob3, kl_all_prob, e_i, e_n, e_t, e_l = model(textf, acouf, visuf, qmask, umask, lengths)
@@ -152,10 +174,12 @@ def train_or_eval_graph_model(model, loss_function, kl_loss, dataloader, cuda, m
                                                                                                           umask))
 
         lp_ = all_prob.view(-1, all_prob.size()[1])
+        valid_flat = umask.view(-1) > 0
+        label_eval = labels_[valid_flat]
         preds.append(torch.argmax(lp_, 1).cpu().numpy())
-        labels.append(labels_.cpu().numpy())
+        labels.append(label_eval.cpu().numpy())
         losses.append(loss.item())
-        masks.append(umask.view(-1).cpu().numpy())
+        masks.append(np.ones(label_eval.size(0), dtype=np.int32))
 
         if train:
             loss.backward()
@@ -165,12 +189,18 @@ def train_or_eval_graph_model(model, loss_function, kl_loss, dataloader, cuda, m
         preds = np.concatenate(preds)
         labels = np.concatenate(labels)
         masks = np.concatenate(masks)
+
+        # 只保留有效位置，排除padding和无效掩码位置
+        valid_idx = masks > 0
+        if np.sum(valid_idx) == 0:
+            return float('nan'), float('nan'), [], [], float('nan'), [], [], [], [], []
+        preds = preds[valid_idx]
+        labels = labels[valid_idx]
+        masks = masks[valid_idx]
     else:
         return float('nan'), float('nan'), [], [], float('nan'), [], [], [], [], []
 
     vids += data[-1]
-    labels = np.array(labels)
-    preds = np.array(preds)
 
     avg_loss = round(np.sum(losses) / len(losses), 4)
     avg_accuracy = round(accuracy_score(labels, preds) * 100, 2)
@@ -180,6 +210,7 @@ def train_or_eval_graph_model(model, loss_function, kl_loss, dataloader, cuda, m
 
 if __name__ == '__main__':
     path = './saved/IEMOCAP/'
+    os.makedirs(path, exist_ok=True)
 
     parser = argparse.ArgumentParser()
 
@@ -236,7 +267,7 @@ if __name__ == '__main__':
                         help='whether to use multimodal information')
 
     parser.add_argument('--fusion_method', default='concat',
-                        help='method to use multimodal information: concat')
+                        help='method to use multimodal information: concat, gated, enhanced_fusion')
 
     parser.add_argument('--modals', default='avl', help='modals to fusion')
 
@@ -244,6 +275,8 @@ if __name__ == '__main__':
                         help='whether to use lstm in acoustic and visual modality')
 
     parser.add_argument('--Dataset', default='IEMOCAP', help='dataset to train and test')
+    parser.add_argument('--loss_type', default='cross_entropy',
+                        help='loss function type: cross_entropy, focal, label_smoothing')
 
     parser.add_argument('--use_speaker', action='store_true', default=True, help='whether to use speaker embedding')
 
@@ -274,9 +307,10 @@ if __name__ == '__main__':
     modals = args.modals
     feat2dim = {'IS10': 1582, '3DCNN': 512, 'textCNN': 1024, 'bert': 768, 'denseface': 342, 'MELD_text': 600,
                 'MELD_audio': 300}
-    D_audio = feat2dim['IS10'] if args.Dataset == 'IEMOCAP' else feat2dim['MELD_audio']
+
+    D_text = feat2dim['MELD_text']
+    D_audio = feat2dim['MELD_audio']
     D_visual = feat2dim['denseface']
-    D_text = feat2dim['textCNN'] if args.Dataset == 'IEMOCAP' else feat2dim['MELD_text']
 
     if args.multi_modal:
         if args.fusion_method == 'concat':
@@ -297,6 +331,60 @@ if __name__ == '__main__':
             D_m = D_visual
         elif modals == 'l':
             D_m = D_text
+    if args.Dataset == 'IEMOCAP':
+        # Local precheck found IEMOCAP feature dims: text=100, audio=100, visual=512
+        D_text = 100
+        D_audio = 100
+        D_visual = 512
+        # Compute multimodal input dim according to fusion settings
+        if args.multi_modal:
+            if args.fusion_method == 'concat':
+                if modals == 'avl':
+                    D_m = D_audio + D_visual + D_text
+                elif modals == 'av':
+                    D_m = D_audio + D_visual
+                elif modals == 'al':
+                    D_m = D_audio + D_text
+                elif modals == 'vl':
+                    D_m = D_visual + D_text
+            else:
+                D_m = D_text
+        else:
+            if modals == 'a':
+                D_m = D_audio
+            elif modals == 'v':
+                D_m = D_visual
+            elif modals == 'l':
+                D_m = D_text
+        print(f"[DEBUG] IEMOCAP 使用维度 → Text:{D_text}  Audio:{D_audio}  Visual:{D_visual}")
+        print(args.fusion_method, modals)
+    elif args.Dataset == 'MELD':
+        # MELD feature dims: text=600, audio=300, visual=512 (synthetic)
+        D_text = 600
+        D_audio = 300
+        D_visual = 512
+        # Compute multimodal input dim according to fusion settings
+        if args.multi_modal:
+            if args.fusion_method == 'concat':
+                if modals == 'avl':
+                    D_m = D_audio + D_visual + D_text
+                elif modals == 'av':
+                    D_m = D_audio + D_visual
+                elif modals == 'al':
+                    D_m = D_audio + D_text
+                elif modals == 'vl':
+                    D_m = D_visual + D_text
+            else:
+                D_m = D_text
+        else:
+            if modals == 'a':
+                D_m = D_audio
+            elif modals == 'v':
+                D_m = D_visual
+            elif modals == 'l':
+                D_m = D_text
+        print(f"[DEBUG] MELD 使用维度 → Text:{D_text}  Audio:{D_audio}  Visual:{D_visual}")
+
 
     D_g = 100
     D_p = 100
@@ -325,8 +413,8 @@ if __name__ == '__main__':
                              multiheads=args.multiheads,
                              graph_construct=args.graph_construct,
                              use_residue=args.use_residue,
-                             D_m_v=1582,
-                             D_m_a=342,
+                             D_m_v=D_visual,
+                             D_m_a=D_audio,
                              modals=args.modals,
                              att_type=args.fusion_method,
                              av_using_lstm=args.av_using_lstm,
@@ -350,20 +438,47 @@ if __name__ == '__main__':
                                           1 / 0.160585,
                                           1 / 0.127711,
                                           1 / 0.252668])
-        loss_function = MaskedNLLLoss(loss_weights.cuda() if cuda else loss_weights)
-    if args.Dataset == 'MELD':
-        loss_function = MaskedNLLLoss(loss_weights.cuda() if cuda else loss_weights)
-    else:
         if args.class_weight:
-            if args.graph_model:
-                loss_function = MaskedNLLLoss(loss_weights.cuda() if cuda else loss_weights)
-            else:
+            if args.loss_type == 'focal':
+                loss_function = FocalLoss(alpha=loss_weights.cuda() if cuda else loss_weights, gamma=2.0)
+            elif args.loss_type == 'label_smoothing':
+                loss_function = LabelSmoothingCrossEntropy(smoothing=0.1)
+            else:  # cross_entropy
                 loss_function = MaskedNLLLoss(loss_weights.cuda() if cuda else loss_weights)
         else:
-            if args.graph_model:
+            if args.loss_type == 'focal':
+                loss_function = FocalLoss(gamma=2.0)
+            elif args.loss_type == 'label_smoothing':
+                loss_function = LabelSmoothingCrossEntropy(smoothing=0.1)
+            else:  # cross_entropy
                 loss_function = MaskedNLLLoss()
-            else:
+    elif args.Dataset == 'MELD':
+        # MELD dataset has 7 emotion classes
+        if args.class_weight:
+            # Define loss weights for MELD (can be adjusted based on class distribution)
+            loss_weights = torch.FloatTensor([1.0] * 7)  # Equal weights by default
+            if args.loss_type == 'focal':
+                loss_function = FocalLoss(alpha=loss_weights.cuda() if cuda else loss_weights, gamma=2.0)
+            elif args.loss_type == 'label_smoothing':
+                loss_function = LabelSmoothingCrossEntropy(smoothing=0.1)
+            else:  # cross_entropy
+                loss_function = MaskedNLLLoss(loss_weights.cuda() if cuda else loss_weights)
+        else:
+            if args.loss_type == 'focal':
+                loss_function = FocalLoss(gamma=2.0)
+            elif args.loss_type == 'label_smoothing':
+                loss_function = LabelSmoothingCrossEntropy(smoothing=0.1)
+            else:  # cross_entropy
                 loss_function = MaskedNLLLoss()
+    else:
+        if args.loss_type == 'focal':
+            loss_function = FocalLoss(gamma=2.0)
+        elif args.loss_type == 'label_smoothing':
+            loss_function = LabelSmoothingCrossEntropy(smoothing=0.1)
+        else:  # cross_entropy
+            loss_function = MaskedNLLLoss()
+
+    print(f"Using loss function: {args.loss_type}")
 
     kl_loss = MaskedKLDivLoss()
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.l2)
@@ -378,7 +493,14 @@ if __name__ == '__main__':
                                                                       num_workers=0)
 
     best_fscore, best_loss, best_label, best_pred, best_mask = None, None, None, None, None
-    all_fscore, all_acc, all_loss = [], [], []
+    
+    # 记录所有指标用于可视化
+    history = {
+        'train_loss': [], 'train_acc': [], 'train_fscore': [],
+        'valid_loss': [], 'valid_acc': [], 'valid_fscore': [],
+        'test_loss': [], 'test_acc': [], 'test_fscore': [],
+        'epochs': []
+    }
 
     for e in range(n_epochs):
         start_time = time.time()
@@ -399,23 +521,44 @@ if __name__ == '__main__':
                                                                                                            cuda,
                                                                                                            args.modals)
 
+        # 记录所有指标
+        history['epochs'].append(e + 1)
+        history['train_loss'].append(train_loss)
+        history['train_acc'].append(train_acc)
+        history['train_fscore'].append(train_fscore)
+        history['valid_loss'].append(valid_loss)
+        history['valid_acc'].append(valid_acc)
+        history['valid_fscore'].append(valid_fscore)
+        history['test_loss'].append(test_loss)
+        history['test_acc'].append(test_acc)
+        history['test_fscore'].append(test_fscore)
+
         if best_fscore == None or best_fscore < test_fscore:
             best_fscore = test_fscore
             best_label, best_pred, best_mask = test_label, test_pred, test_mask
-
-        all_fscore.append(test_fscore)
+            # Save the best model weights
+            torch.save(model.state_dict(), os.path.join(path, name_ + '_best_model.pth'))
+            print(f"Saved best model weights to {os.path.join(path, name_ + '_best_model.pth')}")
 
 
         print(
             'epoch: {}, train_loss: {}, train_acc: {}, train_fscore: {}, valid_loss: {}, valid_acc: {}, valid_fscore: {}, test_loss: {}, test_acc: {}, test_fscore: {}, time: {} sec'. \
             format(e + 1, train_loss, train_acc, train_fscore, valid_loss, valid_acc, valid_fscore, test_loss, test_acc,
                    test_fscore, round(time.time() - start_time, 2)))
-        print(classification_report(best_label, best_pred, sample_weight=best_mask, digits=4))
+        print(classification_report_filter_zero_rows(best_label, best_pred, sample_weight=best_mask, digits=4))
         print(confusion_matrix(best_label, best_pred, sample_weight=best_mask))
 
 
     print('Test performance..')
-    print('F-Score:', max(all_fscore))
+    print('F-Score:', max(history['test_fscore']))
+    
+    # 保存训练历史数据用于可视化
+    import json
+    history_path = os.path.join(path, name_ + '_history.json')
+    with open(history_path, 'w') as f:
+        json.dump(history, f, indent=4)
+    print(f"Training history saved to {history_path}")
+    
     if not os.path.exists("record_{}_{}_{}.pk".format(today.year, today.month, today.day)):
         with open("record_{}_{}_{}.pk".format(today.year, today.month, today.day), 'wb') as f:
             pk.dump({}, f)
@@ -423,15 +566,15 @@ if __name__ == '__main__':
         record = pk.load(f)
     key_ = name_
     if record.get(key_, False):
-        record[key_].append(max(all_fscore))
+        record[key_].append(max(history['test_fscore']))
     else:
-        record[key_] = [max(all_fscore)]
+        record[key_] = [max(history['test_fscore'])]
     if record.get(key_ + 'record', False):
-        record[key_ + 'record'].append(classification_report(best_label, best_pred, sample_weight=best_mask, digits=4))
+        record[key_ + 'record'].append(classification_report_filter_zero_rows(best_label, best_pred, sample_weight=best_mask, digits=4))
     else:
-        record[key_ + 'record'] = [classification_report(best_label, best_pred, sample_weight=best_mask, digits=4)]
+        record[key_ + 'record'] = [classification_report_filter_zero_rows(best_label, best_pred, sample_weight=best_mask, digits=4)]
     with open("record_{}_{}_{}.pk".format(today.year, today.month, today.day), 'wb') as f:
         pk.dump(record, f)
 
-    print(classification_report(best_label, best_pred, sample_weight=best_mask, digits=4))
+    print(classification_report_filter_zero_rows(best_label, best_pred, sample_weight=best_mask, digits=4))
     print(confusion_matrix(best_label, best_pred, sample_weight=best_mask))

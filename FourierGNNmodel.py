@@ -6,15 +6,35 @@ from torch_geometric.nn import RGCNConv, GraphConv
 import numpy as np, itertools, random, copy, math
 from torch.autograd import Variable
 
+from models import MMGatedAttention
+
 class MaskedKLDivLoss(nn.Module):
     def __init__(self):
         super(MaskedKLDivLoss, self).__init__()
-        self.loss = nn.KLDivLoss(reduction='sum')
+        self.loss = nn.KLDivLoss(reduction='none')
 
     def forward(self, log_pred, target, mask):
-        mask_ = mask.view(-1, 1)
-        loss = self.loss(log_pred * mask_, target * mask_) / torch.sum(mask)
-        return loss
+        mask_flat = mask.view(-1)
+        mask_sum = torch.sum(mask_flat)
+        if mask_sum == 0:
+            return torch.tensor(0.0, device=log_pred.device, dtype=log_pred.dtype)
+
+        # Compute KL divergence loss with reduction='none' to get per-sample losses
+        if log_pred.size(0) == mask_flat.size(0):
+            loss_per_sample = self.loss(log_pred, target).sum(dim=1)
+            masked_loss = (loss_per_sample * mask_flat) / mask_sum
+            return torch.sum(masked_loss)
+        else:
+            if target.size(0) == log_pred.size(0):
+                target_flat = target
+            elif target.numel() == mask_flat.numel() * target.size(-1):
+                valid = mask_flat > 0
+                target_flat = target.view(-1, target.size(-1))[valid]
+            else:
+                raise ValueError(f"Unexpected target shape {tuple(target.size())} for mask length {mask_flat.numel()}")
+
+            loss_per_sample = self.loss(log_pred, target_flat).sum(dim=1)
+            return loss_per_sample.sum() / mask_sum
 
 def gelu(x):
     return 0.5 * x * (1 + torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * torch.pow(x, 3))))
@@ -38,16 +58,17 @@ class MaskedNLLLoss(nn.Module):
     def __init__(self, weight=None):
         super(MaskedNLLLoss, self).__init__()
         self.weight = weight
-        self.loss = nn.NLLLoss(weight=weight, reduction='sum')
+        self.loss = nn.NLLLoss(weight=weight, reduction='none')
 
     def forward(self, pred, target, mask):
-        mask_ = mask.view(-1, 1)
-        if type(self.weight) == type(None):
-            loss = self.loss(pred * mask_, target) / torch.sum(mask)
-        else:
-            loss = self.loss(pred * mask_, target) \
-                   / torch.sum(self.weight[target] * mask_.squeeze())
-        return loss
+        mask_ = mask.view(-1)
+        mask_sum = torch.sum(mask_)
+        if mask_sum == 0:
+            return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
+        # Compute loss for all samples, then mask
+        loss_per_sample = self.loss(pred, target)
+        masked_loss = (loss_per_sample * mask_) / mask_sum
+        return torch.sum(masked_loss)
 
 class UnMaskedWeightedNLLLoss(nn.Module):
 
@@ -253,28 +274,37 @@ class MaskedEdgeAttention(nn.Module):
 
         if attn_type == 'attn1':
 
+            device = M.device
             scale = self.scalar(M)
             alpha = F.softmax(scale, dim=0).permute(1, 2, 0)
-            if not self.no_cuda:
-                mask = (torch.ones(alpha.size()) * 1e-10).detach().cuda()
-                mask_copy = torch.zeros(alpha.size()).detach().cuda()
 
-            else:
-                mask = (torch.ones(alpha.size()) * 1e-10).detach()
-                mask_copy = torch.zeros(alpha.size()).detach()
+            mask = torch.zeros_like(alpha, device=device)
+            mask_copy = torch.zeros_like(alpha, device=device)
 
             edge_ind_ = []
-            for i, j in enumerate(edge_ind):
-                for x in j:
-                    edge_ind_.append([i, x[0], x[1]])
+            for batch_index, batch_edges in enumerate(edge_ind):
+                for src, dst in batch_edges:
+                    edge_ind_.append([batch_index, src, dst])
 
-            edge_ind_ = np.array(edge_ind_).transpose()
-            mask[edge_ind_] = 1
-            mask_copy[edge_ind_] = 1
+            if len(edge_ind_) == 0:
+                return torch.zeros_like(alpha, device=device)
+
+            edge_ind_ = torch.tensor(edge_ind_, dtype=torch.long, device=device).t()
+            idx_b, idx_i, idx_j = edge_ind_[0], edge_ind_[1], edge_ind_[2]
+            valid = (idx_b >= 0) & (idx_b < alpha.size(0)) & \
+                    (idx_i >= 0) & (idx_i < alpha.size(1)) & \
+                    (idx_j >= 0) & (idx_j < alpha.size(2))
+            if not valid.all():
+                idx_b = idx_b[valid]
+                idx_i = idx_i[valid]
+                idx_j = idx_j[valid]
+
+            mask[idx_b, idx_i, idx_j] = 1
+            mask_copy[idx_b, idx_i, idx_j] = 1
+
             masked_alpha = alpha * mask
-            _sums = masked_alpha.sum(-1, keepdim=True)
+            _sums = masked_alpha.sum(-1, keepdim=True).clamp_min(1e-9)
             scores = masked_alpha.div(_sums) * mask_copy
-
             return scores
 
         elif attn_type == 'attn2':
@@ -337,24 +367,20 @@ def pad(tensor, length, no_cuda):
 
 
 def edge_perms(l, window_past, window_future):
-    all_perms = set()
-    array = np.arange(l)
-    for j in range(l):
-        perms = set()
+    """快速生成一个会话中所有允许的边对。"""
+    if l == 0:
+        return []
 
-        if window_past == -1 and window_future == -1:
-            eff_array = array
-        elif window_past == -1:
-            eff_array = array[:min(l, j + window_future + 1)]
-        elif window_future == -1:
-            eff_array = array[max(0, j - window_past):]
-        else:
-            eff_array = array[max(0, j - window_past):min(l, j + window_future + 1)]
+    if window_past == -1 and window_future == -1:
+        return [(i, j) for i in range(l) for j in range(l)]
 
-        for item in eff_array:
-            perms.add((j, item))
-        all_perms = all_perms.union(perms)
-    return list(all_perms)
+    edge_pairs = []
+    for i in range(l):
+        start = 0 if window_past == -1 else max(0, i - window_past)
+        end = l if window_future == -1 else min(l, i + window_future + 1)
+        for j in range(start, end):
+            edge_pairs.append((i, j))
+    return edge_pairs
 
 
 def simple_batch_graphify(features, lengths, no_cuda):
@@ -373,47 +399,56 @@ def simple_batch_graphify(features, lengths, no_cuda):
 
 
 def batch_graphify(features, qmask, lengths, window_past, window_future, edge_type_mapping, att_model, no_cuda):
-    edge_index, edge_norm, edge_type, node_features = [], [], [], []
+    edge_index = []
+    edge_norm = []
+    edge_type = []
+    node_features = []
     batch_size = features.size(0)
+    assert len(lengths) == batch_size, \
+        f"batch_graphify lengths mismatch: expected {batch_size}, got {len(lengths)}"
     length_sum = 0
-    edge_ind = []
     edge_index_lengths = []
 
-    for j in range(batch_size):
-        edge_ind.append(edge_perms(lengths[j], window_past, window_future))
+    # 预先计算所有边对
+    edge_ind = [edge_perms(lengths[j], window_past, window_future) for j in range(batch_size)]
     features = features.permute(1, 0, 2)
+    device = features.device
     scores = att_model(features, lengths, edge_ind)
 
     for j in range(batch_size):
-        node_features.append(features[:, j, :])
+        seq_len = lengths[j]
+        node_features.append(features[:seq_len, j, :])
 
-        perms1 = edge_perms(lengths[j], window_past, window_future)
-        perms2 = [(item[0] + length_sum, item[1] + length_sum) for item in perms1]
-        length_sum += lengths[j]
+        perms1 = edge_ind[j]
+        perms2 = [(src + length_sum, dst + length_sum) for src, dst in perms1]
+        length_sum += seq_len
 
         edge_index_lengths.append(len(perms1))
 
-        for item1, item2 in zip(perms1, perms2):
-            edge_index.append(torch.tensor([item2[0], item2[1]]))
-            edge_norm.append(scores[j, item1[0], item1[1]])
-            speaker0 = (qmask[item1[0], j, :] == 1).nonzero()[0][0].tolist()
-            speaker1 = (qmask[item1[1], j, :] == 1).nonzero()[0][0].tolist()
+        speaker_ids = torch.argmax(qmask[:seq_len, j, :], dim=-1)
 
-            if item1[0] < item1[1]:
-                edge_type.append(edge_type_mapping[str(speaker0) + str(speaker1) + '0'])
-            else:
-                edge_type.append(edge_type_mapping[str(speaker0) + str(speaker1) + '1'])
+        for (src, dst), (src_idx, dst_idx) in zip(perms1, perms2):
+            edge_index.append([src_idx, dst_idx])
+            edge_norm.append(scores[j, src, dst])
 
-    node_features = torch.cat(node_features, dim=0)
-    edge_index = torch.stack(edge_index).transpose(0, 1)
-    edge_norm = torch.stack(edge_norm)
-    edge_type = torch.tensor(edge_type)
+            speaker0 = speaker_ids[src].item()
+            speaker1 = speaker_ids[dst].item()
+            edge_key = f"{speaker0}{speaker1}{'0' if src < dst else '1'}"
+            edge_type.append(edge_type_mapping[edge_key])
 
-    if not no_cuda:
-        node_features = node_features.cuda()
-        edge_index = edge_index.cuda()
-        edge_norm = edge_norm.cuda()
-        edge_type = edge_type.cuda()
+    if len(node_features) > 0:
+        node_features = torch.cat(node_features, dim=0)
+    else:
+        node_features = torch.empty(0, features.size(-1), device=device)
+
+    if len(edge_index) > 0:
+        edge_index = torch.tensor(edge_index, dtype=torch.long, device=device).t()
+        edge_norm = torch.stack(edge_norm)
+        edge_type = torch.tensor(edge_type, dtype=torch.long, device=device)
+    else:
+        edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
+        edge_norm = torch.empty((0,), dtype=torch.float, device=device)
+        edge_type = torch.empty((0,), dtype=torch.long, device=device)
 
     return node_features, edge_index, edge_norm, edge_type, edge_index_lengths
 
@@ -479,9 +514,61 @@ def classify_node_features(emotions, seq_lengths, umask, matchatt_layer, linear_
         log_prob = F.log_softmax(hidden, 1)
         return log_prob
 
+
+class ComplexLinear(nn.Module):
+    """Complex-valued linear layer for spectral feature transforms."""
+
+    def __init__(self, in_features, out_features, bias=True):
+        super(ComplexLinear, self).__init__()
+        self.real = nn.Parameter(torch.Tensor(out_features, in_features))
+        self.imag = nn.Parameter(torch.Tensor(out_features, in_features))
+        if bias:
+            self.bias_real = nn.Parameter(torch.Tensor(out_features))
+            self.bias_imag = nn.Parameter(torch.Tensor(out_features))
+        else:
+            self.register_parameter('bias_real', None)
+            self.register_parameter('bias_imag', None)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        stdv = 1. / math.sqrt(self.real.size(1))
+        self.real.data.uniform_(-stdv, stdv)
+        self.imag.data.uniform_(-stdv, stdv)
+        if self.bias_real is not None:
+            self.bias_real.data.zero_()
+            self.bias_imag.data.zero_()
+
+    def forward(self, x):
+        x_real = x.real
+        x_imag = x.imag
+        real = F.linear(x_real, self.real, self.bias_real) - F.linear(x_imag, self.imag, self.bias_imag)
+        imag = F.linear(x_imag, self.real, self.bias_imag) + F.linear(x_real, self.imag, self.bias_real)
+        return torch.complex(real, imag)
+
+
+class SpectralBlock(nn.Module):
+    """A residual spectral transform block for Fourier-domain features."""
+
+    def __init__(self, dim, dropout=0.0, sparsity_threshold=0.01):
+        super(SpectralBlock, self).__init__()
+        self.linear = ComplexLinear(dim, dim)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else None
+        self.sparsity_threshold = sparsity_threshold
+
+    def forward(self, x):
+        z = self.linear(x)
+        z = torch.complex(F.relu(z.real), F.relu(z.imag))
+        if self.dropout is not None:
+            z = torch.complex(self.dropout(z.real), self.dropout(z.imag))
+        z = torch.complex(F.softshrink(z.real, lambd=self.sparsity_threshold),
+                          F.softshrink(z.imag, lambd=self.sparsity_threshold))
+        return x + z
+
+
 class FGN(nn.Module):
     def __init__(self, pre_length, embed_size,
-                 feature_size, seq_length, hidden_size, hard_thresholding_fraction=1, hidden_size_factor=1, sparsity_threshold=0.01):
+                 feature_size, seq_length, hidden_size, hard_thresholding_fraction=1, hidden_size_factor=1, sparsity_threshold=0.01,
+                 dropout=0.1, num_layers=3):
         super().__init__()
         self.embed_size = embed_size
         self.hidden_size = hidden_size
@@ -496,17 +583,11 @@ class FGN(nn.Module):
         self.scale = 0.02
         self.embeddings = nn.Parameter(torch.randn(1, self.embed_size))
 
-        self.w1 = nn.Parameter(
-            self.scale * torch.randn(2, self.frequency_size, self.frequency_size * self.hidden_size_factor))
-        self.b1 = nn.Parameter(self.scale * torch.randn(2, self.frequency_size * self.hidden_size_factor))
-        self.w2 = nn.Parameter(
-            self.scale * torch.randn(2, self.frequency_size * self.hidden_size_factor, self.frequency_size))
-        self.b2 = nn.Parameter(self.scale * torch.randn(2, self.frequency_size))
-        self.w3 = nn.Parameter(
-            self.scale * torch.randn(2, self.frequency_size,
-                                     self.frequency_size * self.hidden_size_factor))
-        self.b3 = nn.Parameter(
-            self.scale * torch.randn(2, self.frequency_size * self.hidden_size_factor))
+        self.spectral_blocks = nn.ModuleList([
+            SpectralBlock(self.frequency_size, dropout=dropout, sparsity_threshold=sparsity_threshold)
+            for _ in range(num_layers)
+        ])
+
         self.embeddings_10 = nn.Parameter(torch.randn(self.seq_length, 8))
         self.fc = nn.Sequential(
             nn.Linear(self.embed_size * 8, 64),
@@ -518,93 +599,30 @@ class FGN(nn.Module):
 
     def tokenEmb(self, x):
         x = x.unsqueeze(2)
-        y = self.embeddings
-        return x * y
+        return x * self.embeddings
 
-    # FourierGNN
     def fourierGC(self, x):
-
-        o1_real = F.relu(
-            torch.einsum('bli,ii->bli', x.real, self.w1[0]) - \
-            torch.einsum('bli,ii->bli', x.imag, self.w1[1]) + \
-            self.b1[0]
-        )
-
-        o1_imag = F.relu(
-            torch.einsum('bli,ii->bli', x.imag, self.w1[0]) + \
-            torch.einsum('bli,ii->bli', x.real, self.w1[1]) + \
-            self.b1[1]
-        )
-
-        # 1 layer
-        y = torch.stack([o1_real, o1_imag], dim=-1)
-        y = F.softshrink(y, lambd=self.sparsity_threshold)
-
-        o2_real = F.relu(
-            torch.einsum('bli,ii->bli', o1_real, self.w2[0]) - \
-            torch.einsum('bli,ii->bli', o1_imag, self.w2[1]) + \
-            self.b2[0]
-        )
-
-        o2_imag = F.relu(
-            torch.einsum('bli,ii->bli', o1_imag, self.w2[0]) + \
-            torch.einsum('bli,ii->bli', o1_real, self.w2[1]) + \
-            self.b2[1]
-        )
-
-        # 2 layer
-        x = torch.stack([o2_real, o2_imag], dim=-1)
-        x = F.softshrink(x, lambd=self.sparsity_threshold)
-        x = x + y
-
-        o3_real = F.relu(
-                torch.einsum('bli,ii->bli', o2_real, self.w3[0]) - \
-                torch.einsum('bli,ii->bli', o2_imag, self.w3[1]) + \
-                self.b3[0]
-        )
-
-        o3_imag = F.relu(
-                torch.einsum('bli,ii->bli', o2_imag, self.w3[0]) + \
-                torch.einsum('bli,ii->bli', o2_real, self.w3[1]) + \
-                self.b3[1]
-        )
-
-        # 3 layer
-        z = torch.stack([o3_real, o3_imag], dim=-1)
-        z = F.softshrink(z, lambd=self.sparsity_threshold)
-        z = z + x
-        z = torch.view_as_complex(z)
-        return z
+        for block in self.spectral_blocks:
+            x = block(x)
+        return x
 
     def forward(self, x):
         B, N = x.shape
-        # embedding B*NL ==> B*NL*D
         x = self.tokenEmb(x)
-
-        # FFT B*NL*D ==> B*NT/2*D
         x = torch.fft.rfft(x, dim=1, norm='ortho')
-
-        x = x.reshape(B, (N)//2+1, self.frequency_size)
+        x = x.reshape(B, (N) // 2 + 1, self.frequency_size)
 
         bias = x
-
-        # FourierGNN
         x = self.fourierGC(x)
-
         x = x + bias
 
-        x = x.reshape(B, (N)//2+1, self.embed_size)
-
-        # ifft
-        x = torch.fft.irfft(x, n=N, dim=1, norm="ortho")
-
+        x = x.reshape(B, (N) // 2 + 1, self.embed_size)
+        x = torch.fft.irfft(x, n=N, dim=1, norm='ortho')
         x = x.reshape(B, N, self.embed_size)
 
-        # projection
         x = torch.matmul(x, self.embeddings_10)
         x = x.reshape(B, -1)
         x = self.fc(x)
-
         return x
 
 
@@ -626,6 +644,14 @@ class GraphNetwork(torch.nn.Module):
 
     def forward(self, x, edge_index, edge_norm, edge_type, seq_lengths, umask, nodal_attn, avec):
         out = self.conv1(x, edge_index, edge_type)
+
+        if edge_norm is not None and edge_norm.numel() > 0:
+            dst = edge_index[1]
+            node_edge_score = torch.zeros(x.size(0), device=x.device).scatter_add_(0, dst, edge_norm)
+            node_degree = torch.bincount(dst, minlength=x.size(0)).unsqueeze(-1).clamp_min(1.0)
+            node_scaling = node_edge_score.unsqueeze(-1) / node_degree
+            out = out * (1.0 + node_scaling)
+
         out = self.conv2(out)
         emotions = torch.cat([x, out], dim=-1)
         if self.return_feature:
@@ -653,70 +679,428 @@ class PositionalEncoding(nn.Module):
         return x
 
 
-class MMGatedAttention(nn.Module):
+class CrossModalAttention(nn.Module):
+    """
+    跨模态注意力机制：允许不同模态之间进行特征交互和增强
+    """
+    def __init__(self, embed_dim, num_heads=8, dropout=0.1):
+        super(CrossModalAttention, self).__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
 
-    def __init__(self, mem_dim, cand_dim, att_type='general'):
-        super(MMGatedAttention, self).__init__()
-        self.mem_dim = mem_dim
-        self.cand_dim = cand_dim
-        self.att_type = att_type
-        self.dropouta = nn.Dropout(0.5)
-        self.dropoutv = nn.Dropout(0.5)
-        self.dropoutl = nn.Dropout(0.5)
-        if att_type == 'av_bg_fusion':
-            self.transform_al = nn.Linear(mem_dim * 2, cand_dim, bias=True)
-            self.scalar_al = nn.Linear(mem_dim, cand_dim)
-            self.transform_vl = nn.Linear(mem_dim * 2, cand_dim, bias=True)
-            self.scalar_vl = nn.Linear(mem_dim, cand_dim)
-        elif att_type == 'general':
-            self.transform_l = nn.Linear(mem_dim, cand_dim, bias=True)
-            self.transform_v = nn.Linear(mem_dim, cand_dim, bias=True)
-            self.transform_a = nn.Linear(mem_dim, cand_dim, bias=True)
-            self.transform_av = nn.Linear(mem_dim * 3, 1)
-            self.transform_al = nn.Linear(mem_dim * 3, 1)
-            self.transform_vl = nn.Linear(mem_dim * 3, 1)
+        assert self.head_dim * num_heads == embed_dim, "embed_dim must be divisible by num_heads"
 
-    def forward(self, a, v, l, modals=None):
-        a = self.dropouta(a) if len(a) != 0 else a
-        v = self.dropoutv(v) if len(v) != 0 else v
-        l = self.dropoutl(l) if len(l) != 0 else l
-        if self.att_type == 'av_bg_fusion':
-            if 'a' in modals:
-                fal = torch.cat([a, l], dim=-1)
-                Wa = torch.sigmoid(self.transform_al(fal))
-                hma = Wa * (self.scalar_al(a))
-            if 'v' in modals:
-                fvl = torch.cat([v, l], dim=-1)
-                Wv = torch.sigmoid(self.transform_vl(fvl))
-                hmv = Wv * (self.scalar_vl(v))
-            if len(modals) == 3:
-                hmf = torch.cat([l, hma, hmv], dim=-1)
-            elif 'a' in modals:
-                hmf = torch.cat([l, hma], dim=-1)
-            elif 'v' in modals:
-                hmf = torch.cat([l, hmv], dim=-1)
-            return hmf
-        elif self.att_type == 'general':
-            ha = torch.tanh(self.transform_a(a)) if 'a' in modals else a
-            hv = torch.tanh(self.transform_v(v)) if 'v' in modals else v
-            hl = torch.tanh(self.transform_l(l)) if 'l' in modals else l
+        self.q_linear = nn.Linear(embed_dim, embed_dim)
+        self.k_linear = nn.Linear(embed_dim, embed_dim)
+        self.v_linear = nn.Linear(embed_dim, embed_dim)
+        self.out_linear = nn.Linear(embed_dim, embed_dim)
 
-            if 'a' in modals and 'v' in modals:
-                z_av = torch.sigmoid(self.transform_av(torch.cat([a, v, a * v], dim=-1)))
-                h_av = z_av * ha + (1 - z_av) * hv
-                if 'l' not in modals:
-                    return h_av
-            if 'a' in modals and 'l' in modals:
-                z_al = torch.sigmoid(self.transform_al(torch.cat([a, l, a * l], dim=-1)))
-                h_al = z_al * ha + (1 - z_al) * hl
-                if 'v' not in modals:
-                    return h_al
-            if 'v' in modals and 'l' in modals:
-                z_vl = torch.sigmoid(self.transform_vl(torch.cat([v, l, v * l], dim=-1)))
-                h_vl = z_vl * hv + (1 - z_vl) * hl
-                if 'a' not in modals:
-                    return h_vl
-            return torch.cat([h_av, h_al, h_vl], dim=-1)
+        self.dropout = nn.Dropout(dropout)
+        self.layer_norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, query, key, value, mask=None):
+        """
+        Args:
+            query: (batch_size, seq_len, embed_dim)
+            key: (batch_size, seq_len, embed_dim)
+            value: (batch_size, seq_len, embed_dim)
+            mask: (batch_size, seq_len) - optional mask for padding
+        Returns:
+            output: (batch_size, seq_len, embed_dim)
+            attention_weights: (batch_size, num_heads, seq_len, seq_len)
+        """
+        batch_size, seq_len, _ = query.size()
+
+        # Linear transformations and reshape
+        Q = self.q_linear(query).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        K = self.k_linear(key).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        V = self.v_linear(value).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # Attention scores
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5)
+
+        # Apply mask if provided
+        if mask is not None:
+            mask = mask.unsqueeze(1).unsqueeze(2)  # (batch_size, 1, 1, seq_len)
+            scores = scores.masked_fill(mask == 0, float('-inf'))
+
+        attention_weights = F.softmax(scores, dim=-1)
+        attention_weights = self.dropout(attention_weights)
+
+        # Apply attention to values
+        context = torch.matmul(attention_weights, V)
+
+        # Concatenate heads and put through final linear layer
+        context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, self.embed_dim)
+        output = self.out_linear(context)
+
+        # Residual connection and layer norm
+        output = self.layer_norm(output + query)
+
+        return output, attention_weights
+
+
+class ModalAdaptiveWeight(nn.Module):
+    """
+    模态自适应权重学习：学习每个模态的重要性权重
+    """
+    def __init__(self, num_modals, embed_dim):
+        super(ModalAdaptiveWeight, self).__init__()
+        self.num_modals = num_modals
+        self.embed_dim = embed_dim
+
+        # 权重预测网络
+        self.weight_net = nn.Sequential(
+            nn.Linear(embed_dim * num_modals, embed_dim),
+            nn.ReLU(),
+            nn.Linear(embed_dim, num_modals),
+            nn.Softmax(dim=-1)
+        )
+
+        # 模态特定变换
+        self.modal_transforms = nn.ModuleList([
+            nn.Linear(embed_dim, embed_dim) for _ in range(num_modals)
+        ])
+
+    def forward(self, modal_features):
+        """
+        Args:
+            modal_features: list of tensors, each (batch_size, seq_len, embed_dim)
+        Returns:
+            weighted_features: (batch_size, seq_len, embed_dim)
+            weights: (batch_size, num_modals)
+        """
+        # 拼接所有模态特征用于权重预测
+        concat_features = torch.cat(modal_features, dim=-1)  # (batch_size, seq_len, embed_dim * num_modals)
+
+        # 预测权重 (在序列维度上平均)
+        avg_features = torch.mean(concat_features, dim=1)  # (batch_size, embed_dim * num_modals)
+        weights = self.weight_net(avg_features)  # (batch_size, num_modals)
+
+        # 应用模态特定变换
+        transformed_features = []
+        for i, features in enumerate(modal_features):
+            transformed = self.modal_transforms[i](features)
+            transformed_features.append(transformed)
+
+        # 加权融合
+        weighted_features = torch.zeros_like(transformed_features[0])
+        for i, features in enumerate(transformed_features):
+            weight = weights[:, i].unsqueeze(-1).unsqueeze(-1)  # (batch_size, 1, 1)
+            weighted_features += weight * features
+
+        return weighted_features, weights
+
+
+class EnhancedModalFusion(nn.Module):
+    """
+    增强的模态融合模块：结合跨模态注意力和自适应权重
+    """
+    def __init__(self, embed_dim, num_modals, num_heads=8, dropout=0.1):
+        super(EnhancedModalFusion, self).__init__()
+        self.embed_dim = embed_dim
+        self.num_modals = num_modals
+
+        # 跨模态注意力层
+        self.cross_attention_layers = nn.ModuleList([
+            CrossModalAttention(embed_dim, num_heads, dropout)
+            for _ in range(num_modals)
+        ])
+
+        # 模态自适应权重
+        self.adaptive_weight = ModalAdaptiveWeight(num_modals, embed_dim)
+
+        # 最终融合层
+        self.fusion_net = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, modal_features, mask=None):
+        """
+        Args:
+            modal_features: list of tensors, each (batch_size, seq_len, embed_dim)
+            mask: (batch_size, seq_len) - optional mask
+        Returns:
+            fused_features: (batch_size, seq_len, embed_dim)
+            attention_weights: list of attention weight tensors
+            modal_weights: (batch_size, num_modals)
+        """
+        enhanced_features = []
+        attention_weights = []
+
+        # 对每个模态，使用其他模态进行增强
+        for i in range(self.num_modals):
+            target_modal = modal_features[i]
+
+            # 收集其他模态作为上下文
+            context_modals = [modal_features[j] for j in range(self.num_modals) if j != i]
+            if context_modals:
+                # 使用其他模态的平均作为上下文
+                context = torch.stack(context_modals, dim=0).mean(dim=0)
+
+                # 跨模态注意力
+                enhanced, attn_weights = self.cross_attention_layers[i](target_modal, context, context, mask)
+                attention_weights.append(attn_weights)
+            else:
+                enhanced = target_modal
+                attention_weights.append(None)
+
+            enhanced_features.append(enhanced)
+
+        # 自适应权重融合
+        fused_features, modal_weights = self.adaptive_weight(enhanced_features)
+
+        # 最终融合
+        fused_features = self.fusion_net(fused_features)
+
+        return fused_features, attention_weights, modal_weights
+
+
+class EnhancedEmotionClassifier(nn.Module):
+    """
+    增强的情感分类器：支持多层架构、残差连接和多种正则化技术
+    """
+    def __init__(self, input_dim, n_classes, hidden_dims=[512, 256], dropout=0.5,
+                 use_residual=True, use_batch_norm=True, activation='relu'):
+        super(EnhancedEmotionClassifier, self).__init__()
+
+        self.input_dim = input_dim
+        self.n_classes = n_classes
+        self.hidden_dims = hidden_dims
+        self.use_residual = use_residual
+        self.use_batch_norm = use_batch_norm
+
+        # 激活函数选择
+        if activation == 'relu':
+            self.activation = nn.ReLU()
+        elif activation == 'gelu':
+            self.activation = nn.GELU()
+        elif activation == 'leaky_relu':
+            self.activation = nn.LeakyReLU(0.1)
+        else:
+            self.activation = nn.ReLU()
+
+        # 构建多层分类器
+        layers = []
+        current_dim = input_dim
+
+        for i, hidden_dim in enumerate(hidden_dims):
+            # 线性层
+            layers.append(nn.Linear(current_dim, hidden_dim))
+
+            # 批归一化
+            if use_batch_norm:
+                layers.append(nn.BatchNorm1d(hidden_dim))
+
+            # 激活函数
+            layers.append(self.activation)
+
+            # Dropout
+            layers.append(nn.Dropout(dropout))
+
+            # 残差连接准备
+            if use_residual and current_dim == hidden_dim:
+                self.residual_layer = nn.Identity()
+            elif use_residual and i == 0:
+                self.residual_proj = nn.Linear(input_dim, hidden_dims[-1])
+
+            current_dim = hidden_dim
+
+        # 输出层
+        layers.append(nn.Linear(current_dim, n_classes))
+
+        self.classifier = nn.Sequential(*layers)
+
+        # 温度缩放参数（用于校准）
+        self.temperature = nn.Parameter(torch.ones(1))
+
+    def forward(self, x, return_logits=False):
+        """
+        Args:
+            x: 输入特征 (batch_size, seq_len, input_dim) 或 (batch_size, input_dim)
+            return_logits: 是否返回logits而不是概率
+        Returns:
+            分类概率或logits
+        """
+        # 处理序列输入
+        if x.dim() == 3:
+            batch_size, seq_len, feature_dim = x.size()
+            x = x.view(-1, feature_dim)  # (batch_size * seq_len, feature_dim)
+
+        # 残差连接
+        if self.use_residual and hasattr(self, 'residual_proj'):
+            residual = self.residual_proj(x)
+
+        # 分类器前向传播
+        logits = self.classifier(x)
+
+        # 温度缩放
+        scaled_logits = logits / self.temperature
+
+        if return_logits:
+            return scaled_logits
+
+        # 返回概率分布
+        return F.softmax(scaled_logits, dim=-1)
+
+
+class FocalLoss(nn.Module):
+    """
+    焦点损失：用于处理类别不平衡问题
+    """
+    def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+        if alpha is not None:
+            if isinstance(alpha, (list, tuple)):
+                self.alpha = torch.tensor(alpha)
+            elif isinstance(alpha, torch.Tensor):
+                self.alpha = alpha
+            else:
+                self.alpha = torch.ones(alpha)
+
+    def forward(self, inputs, targets):
+        """
+        Args:
+            inputs: 预测logits (N, C)
+            targets: 目标标签 (N,)
+        """
+        # 计算交叉熵损失
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+
+        # 计算预测概率
+        pt = torch.exp(-ce_loss)
+
+        # 计算焦点权重
+        focal_weight = (1 - pt) ** self.gamma
+
+        # 应用类别权重
+        if self.alpha is not None:
+            if self.alpha.device != inputs.device:
+                self.alpha = self.alpha.to(inputs.device)
+            alpha_weight = self.alpha[targets]
+            focal_weight = focal_weight * alpha_weight
+
+        # 应用权重
+        loss = focal_weight * ce_loss
+
+        # 损失聚合
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
+
+
+class LabelSmoothingCrossEntropy(nn.Module):
+    """
+    标签平滑交叉熵损失
+    """
+    def __init__(self, smoothing=0.1):
+        super(LabelSmoothingCrossEntropy, self).__init__()
+        self.smoothing = smoothing
+
+    def forward(self, pred, target):
+        confidence = 1. - self.smoothing
+        log_probs = F.log_softmax(pred, dim=-1)
+        nll_loss = -log_probs.gather(dim=-1, index=target.unsqueeze(1))
+        nll_loss = nll_loss.squeeze(1)
+        smooth_loss = -log_probs.mean(dim=-1)
+        loss = confidence * nll_loss + self.smoothing * smooth_loss
+        return loss.mean()
+
+
+class MultiTaskEmotionClassifier(nn.Module):
+    """
+    多任务情感分类器：同时预测多个相关任务
+    """
+    def __init__(self, input_dim, n_classes, hidden_dims=[512, 256], dropout=0.5,
+                 use_auxiliary=True, auxiliary_weight=0.3):
+        super(MultiTaskEmotionClassifier, self).__init__()
+
+        self.input_dim = input_dim
+        self.n_classes = n_classes
+        self.use_auxiliary = use_auxiliary
+        self.auxiliary_weight = auxiliary_weight
+
+        # 主分类器
+        self.main_classifier = EnhancedEmotionClassifier(
+            input_dim, n_classes, hidden_dims, dropout
+        )
+
+        # 辅助任务：情感强度预测（回归任务）
+        if use_auxiliary:
+            self.intensity_predictor = nn.Sequential(
+                nn.Linear(input_dim, hidden_dims[0] // 2),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dims[0] // 2, 1),
+                nn.Sigmoid()  # 输出0-1之间的强度值
+            )
+
+        # 置信度估计器
+        self.confidence_estimator = nn.Sequential(
+            nn.Linear(input_dim, hidden_dims[0] // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dims[0] // 2, 1),
+            nn.Sigmoid()  # 输出0-1之间的置信度
+        )
+
+    def forward(self, x, return_logits=False, return_auxiliary=False):
+        """
+        Args:
+            x: 输入特征
+            return_logits: 是否返回logits而不是概率
+            return_auxiliary: 是否返回辅助任务输出
+        Returns:
+            主分类概率或logits，(可选)辅助输出
+        """
+        # 主分类
+        main_output = self.main_classifier(x, return_logits=return_logits)
+
+        if not return_auxiliary:
+            return main_output
+
+        # 辅助任务
+        auxiliary_outputs = {}
+
+        if self.use_auxiliary:
+            intensity = self.intensity_predictor(x)
+            auxiliary_outputs['intensity'] = intensity
+
+        confidence = self.confidence_estimator(x)
+        auxiliary_outputs['confidence'] = confidence
+
+        return main_output, auxiliary_outputs
+
+    def compute_loss(self, main_logits, targets, auxiliary_outputs=None, class_weights=None):
+        """
+        计算多任务损失
+        """
+        # 主分类损失
+        if class_weights is not None:
+            main_loss = F.cross_entropy(main_logits, targets, weight=class_weights)
+        else:
+            main_loss = F.cross_entropy(main_logits, targets)
+
+        total_loss = main_loss
+
+        # 辅助任务损失
+        if auxiliary_outputs is not None:
+            # 这里可以添加辅助任务的监督信号
+            # 例如，如果有强度标签或置信度标签
+            pass
+
+        return total_loss
 
 
 class DialogueGCNModel(nn.Module):
@@ -769,11 +1153,11 @@ class DialogueGCNModel(nn.Module):
         self.linear_t = nn.Linear(D_m, hidden_dim)
 
         self.lstm_t = nn.LSTM(input_size=hidden_dim, hidden_size=D_e, num_layers=2, bidirectional=True,
-                            dropout=dropout)
+                            dropout=dropout, batch_first=True)
         self.lstm_a = nn.LSTM(input_size=hidden_dim, hidden_size=D_e, num_layers=2, bidirectional=True,
-                            dropout=dropout)
+                            dropout=dropout, batch_first=True)
         self.lstm_v = nn.LSTM(input_size=hidden_dim, hidden_size=D_e, num_layers=2, bidirectional=True,
-                            dropout=dropout)
+                            dropout=dropout, batch_first=True)
 
         self.pos_emb_a = PositionalEncoding(hidden_dim)
         self.pos_emb_v = PositionalEncoding(hidden_dim)
@@ -801,7 +1185,14 @@ class DialogueGCNModel(nn.Module):
                 edge_type_mapping[str(j) + str(k) + '1'] = len(edge_type_mapping)
 
         self.edge_type_mapping = edge_type_mapping
-        self.gatedatt = MMGatedAttention(2 * D_e + graph_hidden_size, graph_hidden_size, att_type='general')
+
+        # 使用增强的模态融合模块替代原来的门控注意力
+        if self.multi_modal and len(self.modals) > 1:
+            self.enhanced_fusion = EnhancedModalFusion(2 * D_e + graph_hidden_size, len(self.modals),
+                                                     num_heads=8, dropout=dropout)
+        else:
+            self.gatedatt = MMGatedAttention(2 * D_e + graph_hidden_size, graph_hidden_size, att_type='general')
+
         self.dropout_ = nn.Dropout(self.dropout)
         if self.att_type == 'concat_subsequently':
             self.smax_fc = nn.Linear(300 * len(self.modals), n_classes)
@@ -810,9 +1201,23 @@ class DialogueGCNModel(nn.Module):
                 self.smax_fc = nn.Linear(100 * len(self.modals), n_classes)
             else:
                 self.smax_fc = nn.Linear(100, n_classes)
+        elif self.att_type == 'enhanced_fusion':
+            # 增强融合的输出维度
+            self.smax_fc = nn.Linear(2 * D_e + graph_hidden_size, n_classes)
         else:
             self.smax_fc = nn.Linear(2 * D_e + graph_hidden_size, n_classes)
 
+        # 使用增强的情感分类器
+        classifier_input_dim = 2 * D_e + graph_hidden_size
+        self.enhanced_classifier = MultiTaskEmotionClassifier(
+            input_dim=classifier_input_dim,
+            n_classes=n_classes,
+            hidden_dims=[512, 256],
+            dropout=dropout,
+            use_auxiliary=True
+        )
+
+        # 保留原有的简单输出层作为备选
         self.t_output_layer = nn.Sequential(
             nn.ReLU(),
             nn.Dropout(dropout),
@@ -829,7 +1234,7 @@ class DialogueGCNModel(nn.Module):
             nn.Linear(2 * D_e + graph_hidden_size, n_classes)
         )
 
-    def forward(self, textf, visuf, acouf, qmask, umask, seq_lengths):
+    def forward(self, textf, acouf, visuf, qmask, umask, seq_lengths):
         spk_idx = torch.argmax(qmask.permute(1, 0, 2), -1)
         origin_spk_idx = spk_idx
         if self.n_speakers == 2:
@@ -892,26 +1297,59 @@ class DialogueGCNModel(nn.Module):
         emotions_t = self.graph_net_l(features_l, edge_index, edge_norm, edge_type, seq_lengths, umask,
                                       self.nodal_attention, self.avec)
 
+        # 使用增强分类器进行预测
+        t_final_out = self.enhanced_classifier(emotions_t, return_logits=True)
+        a_final_out = self.enhanced_classifier(emotions_a, return_logits=True)
+        v_final_out = self.enhanced_classifier(emotions_v, return_logits=True)
 
-        t_final_out = self.t_output_layer(emotions_t)
-        a_final_out = self.a_output_layer(emotions_a)
-        v_final_out = self.v_output_layer(emotions_v)
-
+        # 获取概率分布
         t_log_prob = F.log_softmax(t_final_out, 1)
         a_log_prob = F.log_softmax(a_final_out, 1)
         v_log_prob = F.log_softmax(v_final_out, 1)
+
+        # 获取多模态融合的概率
+        _, auxiliary_t = self.enhanced_classifier(emotions_t, return_auxiliary=True)
+        _, auxiliary_a = self.enhanced_classifier(emotions_a, return_auxiliary=True)
+        _, auxiliary_v = self.enhanced_classifier(emotions_v, return_auxiliary=True)
 
         kl_t_log_prob = F.log_softmax(t_final_out, 1)
         kl_a_log_prob = F.log_softmax(a_final_out, 1)
         kl_v_log_prob = F.log_softmax(v_final_out, 1)
 
+        # 使用增强的模态融合或传统的门控注意力
+        if self.multi_modal and len(self.modals) > 1 and hasattr(self, 'enhanced_fusion'):
+            # 准备模态特征列表
+            modal_features = []
+            if 'a' in self.modals:
+                modal_features.append(emotions_a)
+            if 'v' in self.modals:
+                modal_features.append(emotions_v)
+            if 'l' in self.modals:
+                modal_features.append(emotions_t)
 
-        emotions_feat = self.gatedatt(emotions_a, emotions_v, emotions_t, self.modals)
+            # 创建mask用于跨模态注意力
+            batch_size = emotions_a.size(0) if len(emotions_a.size()) > 0 else emotions_t.size(0)
+            seq_len = max(seq_lengths)
+            mask = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=emotions_t.device)
+            for i, length in enumerate(seq_lengths):
+                mask[i, :length] = 1
+
+            # 增强模态融合
+            emotions_feat, attention_weights, modal_weights = self.enhanced_fusion(modal_features, mask)
+        else:
+            # 传统门控注意力融合
+            emotions_feat = self.gatedatt(emotions_a, emotions_v, emotions_t, self.modals)
 
         emotions_feat = self.dropout_(emotions_feat)
-        final_out = self.smax_fc(emotions_feat)
+
+        # 使用增强分类器进行最终多模态分类
+        final_out = self.enhanced_classifier(emotions_feat, return_logits=True)
         all_log_prob = F.log_softmax(final_out, 1)
         all_prob = F.softmax(final_out, 1)
         kl_all_prob = F.softmax(final_out, 1)
+
+        # 获取辅助输出用于分析
+        _, auxiliary_all = self.enhanced_classifier(emotions_feat, return_auxiliary=True)
+
         return t_log_prob, a_log_prob, v_log_prob, all_log_prob, all_prob, \
                kl_t_log_prob, kl_a_log_prob, kl_v_log_prob, kl_all_prob, edge_index, edge_norm, edge_type, edge_index_lengths
