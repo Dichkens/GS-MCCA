@@ -1,4 +1,4 @@
-# GS-MCC: Multimodal Emotion Recognition with Graph Spectrum and Fourier GNN
+# GS-MCCA: Multimodal Emotion Recognition with Graph Spectrum and Fourier GNN Derived from GS-MCC iteration
 
 > 这是一个基于跨模态注意力的多模态情感识别模型，结合图谱谱特征、傅里叶图神经网络和多模态融合优化。支持 IEMOCAP 与 MELD 数据集，包含训练、推理、可视化和多项优化方案说明。
 
